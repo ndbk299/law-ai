@@ -23,9 +23,9 @@ PORT = 8000
 
 # Import Medical AI Engine
 try:
-    from backend.ai_engine import ai_engine
+    from backend.ai_engine import LLMProviderError, ai_engine
 except ImportError:
-    from ai_engine import ai_engine
+    from ai_engine import LLMProviderError, ai_engine
 
 
 def normalize(text: str) -> str:
@@ -249,7 +249,11 @@ class LawGPTRequestHandler(SimpleHTTPRequestHandler):
             current_group = payload.get("group", None)
 
             # Xử lý thông qua Medical AI Engine (RAG + NER + Guardrails + Generator)
-            response = ai_engine.process(message, current_group)
+            try:
+                response = ai_engine.process(message, current_group)
+            except LLMProviderError as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
             self._send_json(HTTPStatus.OK, response)
             return
 

@@ -401,43 +401,144 @@ class MedicalRAG:
 # PHẦN 4: GENERATIVE LLM RESPONSE SYNTHESIS (TỔNG HỢP PHẢN HỒI AI)
 # ==============================================================================
 
+class LLMProviderError(RuntimeError):
+    """Lỗi cấu hình hoặc kết nối tới nhà cung cấp mô hình ngôn ngữ."""
+
+
 class MedicalLLMGenerator:
-    """Mô-đun sinh ngôn ngữ y tế: hỗ trợ Cloud LLM (Gemini/OpenAI) và Autonomous Engine nội bộ"""
+    """Sinh phản hồi bằng Gemini, OpenAI, Ollama hoặc bộ xử lý nội bộ."""
 
     def __init__(self):
-        self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.provider = "gemini" if os.environ.get("GEMINI_API_KEY") else ("openai" if os.environ.get("OPENAI_API_KEY") else "local")
-
+        cfg = {}
         if CONFIG_PATH.exists():
             try:
                 cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-                if cfg.get("gemini_api_key"):
-                    self.api_key = cfg["gemini_api_key"]
-                    self.provider = "gemini"
-                elif cfg.get("openai_api_key"):
-                    self.api_key = cfg["openai_api_key"]
-                    self.provider = "openai"
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as exc:
+                raise LLMProviderError(f"Không đọc được cấu hình LLM tại {CONFIG_PATH}: {exc}") from exc
+            if not isinstance(cfg, dict):
+                raise LLMProviderError(f"Cấu hình LLM tại {CONFIG_PATH} phải là một JSON object.")
 
-    def _call_gemini_api(self, prompt: str) -> str | None:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 800}
+        self.api_keys = {
+            "gemini": os.environ.get("GEMINI_API_KEY") or cfg.get("gemini_api_key", ""),
+            "openai": os.environ.get("OPENAI_API_KEY") or cfg.get("openai_api_key", ""),
         }
+        selected_provider = os.environ.get("AI_PROVIDER") or cfg.get("provider")
+        if selected_provider:
+            self.provider = str(selected_provider).strip().lower()
+        elif self.api_keys["gemini"]:
+            self.provider = "gemini"
+        elif self.api_keys["openai"]:
+            self.provider = "openai"
+        elif os.environ.get("OLLAMA_MODEL") or os.environ.get("OLLAMA_BASE_URL"):
+            self.provider = "ollama"
+        else:
+            self.provider = "local"
+
+        if self.provider not in {"gemini", "openai", "ollama", "local"}:
+            raise LLMProviderError(
+                "AI_PROVIDER không hợp lệ. Chọn gemini, openai, ollama hoặc local."
+            )
+        if self.provider in self.api_keys and not self.api_keys[self.provider]:
+            raise LLMProviderError(f"Thiếu API key cho AI_PROVIDER={self.provider}.")
+
+        self.models = {
+            "gemini": os.environ.get("GEMINI_MODEL") or cfg.get("gemini_model") or "gemini-2.5-flash",
+            "openai": os.environ.get("OPENAI_MODEL") or cfg.get("openai_model") or "gpt-4o-mini",
+            "ollama": os.environ.get("OLLAMA_MODEL") or cfg.get("ollama_model") or "llama3.2",
+        }
+        self.openai_base_url = (
+            os.environ.get("OPENAI_BASE_URL")
+            or cfg.get("openai_base_url")
+            or "https://api.openai.com/v1"
+        ).rstrip("/")
+        self.ollama_base_url = (
+            os.environ.get("OLLAMA_BASE_URL")
+            or cfg.get("ollama_base_url")
+            or "http://localhost:11434"
+        ).rstrip("/")
         try:
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            return None
+            self.timeout = float(os.environ.get("AI_TIMEOUT_SECONDS", "30"))
+        except ValueError as exc:
+            raise LLMProviderError("AI_TIMEOUT_SECONDS phải là số dương.") from exc
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise LLMProviderError("AI_TIMEOUT_SECONDS phải là số dương.")
+
+    def _post_json(self, url: str, payload: dict, headers: dict, provider: str) -> dict:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise LLMProviderError(f"{provider} API trả về HTTP {exc.code}.") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise LLMProviderError(f"Không thể kết nối tới {provider} API: {exc}") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LLMProviderError(f"{provider} API trả về dữ liệu JSON không hợp lệ.") from exc
+        if not isinstance(data, dict):
+            raise LLMProviderError(f"{provider} API trả về dữ liệu không đúng định dạng.")
+        return data
+
+    @staticmethod
+    def _response_text(data: dict, provider: str) -> str:
+        try:
+            if provider == "gemini":
+                parts = data["candidates"][0]["content"]["parts"]
+                text = "\n".join(part["text"] for part in parts if isinstance(part.get("text"), str))
+            elif provider == "openai":
+                text = data["choices"][0]["message"]["content"]
+            else:
+                text = data["message"]["content"]
+        except (AttributeError, KeyError, IndexError, TypeError) as exc:
+            raise LLMProviderError(f"{provider} API không trả về nội dung câu trả lời hợp lệ.") from exc
+        if not isinstance(text, str) or not text.strip():
+            raise LLMProviderError(f"{provider} API trả về câu trả lời rỗng.")
+        return text.strip()
+
+    def _call_provider(self, messages: list[dict]) -> str:
+        headers = {"Content-Type": "application/json"}
+        if self.provider == "gemini":
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{self.models['gemini']}:generateContent"
+            )
+            headers["x-goog-api-key"] = self.api_keys["gemini"]
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": messages[0]["content"] + "\n\n" + messages[1]["content"]}],
+                    }
+                ],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 800},
+            }
+        elif self.provider == "openai":
+            url = f"{self.openai_base_url}/chat/completions"
+            headers["Authorization"] = f"Bearer {self.api_keys['openai']}"
+            payload = {
+                "model": self.models["openai"],
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": 800,
+            }
+        else:
+            url = f"{self.ollama_base_url}/api/chat"
+            payload = {
+                "model": self.models["ollama"],
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.2, "num_predict": 800},
+            }
+
+        response = self._post_json(url, payload, headers, self.provider)
+        return self._response_text(response, self.provider)
 
     def generate(self, user_query: str, entities: dict, retrieved_drugs: list[dict]) -> tuple[str, list[dict]]:
-        # 1. Trường hợp có Cloud LLM Key
-        if self.provider == "gemini" and self.api_key:
+        if self.provider != "local":
             context_text = "\n\n".join([
                 f"- Tên thuốc: {d['name']} ({d['active_ingredient']})\n"
                 f"  Dạng bào chế: {d['form']} | Nhóm: {d['group_name']}\n"
@@ -447,27 +548,31 @@ class MedicalLLMGenerator:
                 f"  Chống chỉ định: {d.get('contraindications', '')}\n"
                 f"  Tác dụng phụ: {d.get('side_effects', '')}"
                 for d in retrieved_drugs
-            ])
-            prompt = (
-                "Bạn là Trợ lý AI Dược phẩm 'Law GPT' của Infranixx. Trả lời bằng tiếng Việt chuyên nghiệp, ân cần và chuẩn y khoa.\n"
-                "CHỈ ĐƯỢC sử dụng thông tin trong tài liệu sau đây để trả lời, TUYỆT ĐỐI KHÔNG tự bịa ra thuốc ngoài tài liệu:\n"
-                "=== TÀI LIỆU DƯỢC THƯ BỘ Y TẾ ===\n"
-                f"{context_text}\n"
-                "=================================\n\n"
-                f"Câu hỏi của người dùng: '{user_query}'\n"
-                f"Thực thể nhận diện: Triệu chứng={entities['symptoms']}, Đối tượng={entities['demographics']}, Tiền sử={entities['conditions']}\n"
-                "Yêu cầu:\n"
-                "1. Trả lời ngắn gọn, gạch đầu dòng các thuốc phù hợp kèm liều dùng tham khảo.\n"
-                "2. Nếu có cảnh báo chống chỉ định với đối tượng/tiền sử, phải in đậm cảnh báo.\n"
-                "3. Luôn kết thúc bằng câu khuyến cáo tham khảo ý kiến bác sĩ/dược sĩ."
+            ]) or "(Không tìm thấy tài liệu thuốc phù hợp trong cơ sở dữ liệu.)"
+            system_prompt = (
+                "Bạn là Trợ lý AI Dược phẩm Law GPT. Trả lời bằng tiếng Việt tự nhiên, rõ ràng và ân cần. "
+                "Chỉ dùng tài liệu thuốc được cung cấp; không tự bịa thuốc, chỉ định hoặc liều dùng. "
+                "Nếu tài liệu không có thông tin để trả lời, hãy nói rõ điều đó và khuyến nghị hỏi bác sĩ/dược sĩ. "
+                "Không chẩn đoán bệnh và luôn nhắc thông tin chỉ mang tính tham khảo."
             )
-            cloud_reply = self._call_gemini_api(prompt)
-            if cloud_reply:
-                choices = [{"label": d["name"], "query": d["name"]} for d in retrieved_drugs[:4]]
-                choices.append({"label": "Chọn nhóm khác", "query": "nhóm thuốc"})
-                return cloud_reply, choices
+            user_prompt = (
+                f"Tài liệu thuốc:\n{context_text}\n\n"
+                f"Câu hỏi: {user_query}\n"
+                f"Thông tin nhận diện: triệu chứng={entities.get('symptoms', [])}, "
+                f"đối tượng={entities.get('demographics', [])}, "
+                f"tiền sử={entities.get('conditions', [])}.\n"
+                "Trả lời ngắn gọn, nêu cảnh báo chống chỉ định nếu có và kết thúc bằng khuyến cáo "
+                "tham khảo ý kiến bác sĩ/dược sĩ."
+            )
+            cloud_reply = self._call_provider([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ])
+            choices = [{"label": d["name"], "query": d["name"]} for d in retrieved_drugs[:4]]
+            choices.append({"label": "Chọn nhóm khác", "query": "nhóm thuốc"})
+            return cloud_reply, choices
 
-        # 2. Local Medical Engine
+        # Bộ xử lý nội bộ giữ vai trò dự phòng khi không cấu hình dịch vụ LLM.
         intent = entities["intent"]
         symptoms = entities["symptoms"]
         demos = entities["demographics"]

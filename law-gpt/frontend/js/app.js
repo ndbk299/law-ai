@@ -436,7 +436,10 @@
           }));
         }
       });
-    }).catch(function () { handleLocal(text); });
+    }).catch(function (error) {
+      console.error("Law GPT chat request failed:", error);
+      botSay("Xin lỗi, hiện không thể kết nối với mô hình AI. Vui lòng kiểm tra cấu hình dịch vụ hoặc thử lại sau.");
+    });
   }
 
   chatForm.addEventListener("submit", function (e) {
